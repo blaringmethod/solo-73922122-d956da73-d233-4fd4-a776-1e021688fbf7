@@ -15,6 +15,9 @@
    在它响应前发起关闭，关闭返回后再取页 -> 409 且无明细。
 5. 到期失效（可选，较慢）：设置 DEMO_TTL_WAIT=1 时，
    等待会话到期后取页 -> 410 且无明细。
+6. 结算核对 POST /settlement-checks：足额覆盖标记可入仓；冲正剔除、
+   四类差异分类、前 30 条截断与计数、重复 ID/非法冲正整批拒绝、
+   核对进行中关闭受理必须失败且不返回结论。
 """
 from __future__ import annotations
 
@@ -195,6 +198,125 @@ def main() -> int:
         check(st == 201 and s7["status"] == "open", "到期释放名额后可开启新会话")
         call("POST", f"/sessions/{s7['session_id']}/close")
 
+    # ------------------------------------------------------------------
+    title(6, "结算核对 POST /settlement-checks（华南 40 条快照，逐笔核对净支付）")
+    _, sc = call("POST", "/sessions", {"region": "华南"})
+    scid = sc["session_id"]
+
+    # 翻完快照全部页，拿到核对基准（仅演示侧取数，服务端不缓存全集）
+    snapshot, page_no = [], 1
+    while True:
+        st, b = call("GET", f"/sessions/{scid}/claims?page={page_no}&page_size=100")
+        snapshot.extend(b["rows"])
+        if not b["has_more"]:
+            break
+        page_no += 1
+    check(len(snapshot) == 40, f"取齐华南快照 {len(snapshot)} 条作为核对基准")
+
+    def pay(tid, cid, amount):
+        return {"type": "payment", "transaction_id": tid,
+                "claim_id": cid, "amount": amount}
+
+    def rev(tid, cid, original):
+        return {"type": "reversal", "transaction_id": tid,
+                "claim_id": cid, "original_transaction_id": original}
+
+    # 6.1 全部足额覆盖 -> 可入仓
+    full = [pay(f"P{r['claim_id']}", r["claim_id"], r["amount"]) for r in snapshot]
+    st, ok = call("POST", "/settlement-checks",
+                  {"session_id": scid, "transactions": full})
+    check(st == 200 and ok["ready_for_warehouse"] is True,
+          f"足额覆盖 40 笔 -> ready_for_warehouse=true（差异 {ok['total_difference_count']}）")
+    check(ok["snapshot_claim_count"] == 40 and ok["transaction_count"] == 40,
+          "回执含快照理赔笔数 40 与受理交易笔数 40")
+
+    # 6.2 冲正剔除 + 四类差异：少付/超付/未结算（冲正后净额 0）/无源
+    under, over, unsettled = snapshot[0], snapshot[1], snapshot[2]
+    mixed = [
+        pay("M1", under["claim_id"], under["amount"] - 100),       # 少付 100
+        pay("M2", over["claim_id"], over["amount"] + 100),         # 超付 100
+        pay("M3", unsettled["claim_id"], unsettled["amount"]),
+        rev("M3R", unsettled["claim_id"], "M3"),                   # 全额冲正 -> 未结算
+        pay("M4", 999000111, 500),                                 # 无源理赔
+    ]
+    st, diff = call("POST", "/settlement-checks",
+                    {"session_id": scid, "transactions": mixed})
+    check(st == 200 and diff["ready_for_warehouse"] is False, "存在差异 -> 不可入仓")
+    check(diff["underpaid_count"] == 1 and diff["overpaid_count"] == 1,
+          f"少付 {diff['underpaid_count']} 笔、超付 {diff['overpaid_count']} 笔")
+    check(diff["unsettled_count"] == 38, f"冲正后未结算 {diff['unsettled_count']} 笔（40-2 笔有效支付）")
+    check(diff["orphan_count"] == 1, f"无源理赔 {diff['orphan_count']} 笔")
+    check(diff["total_difference_count"] == 41 and diff["differences_truncated"] is True,
+          f"差异总笔数 {diff['total_difference_count']}（计数不随前 30 条截断），截断标记=true")
+    check(len(diff["differences"]) == 30, "差异明细只返回按理赔 ID 升序的前 30 条")
+    ids = [d["claim_id"] for d in diff["differences"]]
+    check(ids == sorted(ids), "返回的差异明细按理赔 ID 升序")
+
+    # 6.3 重复交易 ID：整批 422 拒绝，无任何核对结论
+    st, rej1 = call("POST", "/settlement-checks", {
+        "session_id": scid,
+        "transactions": [pay("DUP", snapshot[0]["claim_id"], 1),
+                         pay("DUP", snapshot[1]["claim_id"], 2)],
+    })
+    check(st == 422 and rej1["code"] == "duplicate_transaction_id",
+          f"重复 ID 整批拒绝 HTTP {st} code={rej1.get('code')}")
+    check("differences" not in rej1 and "ready_for_warehouse" not in rej1,
+          "拒绝响应不含部分核对结论")
+
+    # 6.4 非法冲正（跨理赔/引用不存在/重复冲正）：整批 422 拒绝
+    c1, c2 = snapshot[0]["claim_id"], snapshot[1]["claim_id"]
+    st, rej2 = call("POST", "/settlement-checks", {
+        "session_id": scid,
+        "transactions": [pay("X1", c1, 10), rev("X2", c2, "X1")],
+    })
+    check(st == 422 and rej2["code"] == "invalid_reversal",
+          f"跨理赔冲正整批拒绝 HTTP {st} code={rej2.get('code')}")
+    st, rej3 = call("POST", "/settlement-checks", {
+        "session_id": scid,
+        "transactions": [rev("Y1", c1, "ghost")],
+    })
+    check(st == 422 and rej3["code"] == "invalid_reversal",
+          "引用本批不存在的原交易 -> invalid_reversal")
+    st, rej4 = call("POST", "/settlement-checks", {
+        "session_id": scid,
+        "transactions": [pay("Z1", c1, 10), rev("Z2", c1, "Z1"),
+                         rev("Z3", c1, "Z1")],
+    })
+    check(st == 422 and rej4["code"] == "invalid_reversal",
+          "对同一支付重复冲正 -> invalid_reversal")
+
+    # 6.5 空批：全部快照理赔判为未结算，不可入仓
+    st, empty = call("POST", "/settlement-checks",
+                     {"session_id": scid, "transactions": []})
+    check(st == 200 and empty["unsettled_count"] == 40
+          and empty["ready_for_warehouse"] is False,
+          "空批核对：40 笔全部未结算，不可入仓")
+
+    # 6.6 核对进行中关闭受理：慢核对 + 关闭交错，核对失败且无结论
+    box = {}
+
+    def slow_check():
+        box["r"] = call(
+            "POST", "/settlement-checks",
+            {"session_id": scid, "transactions": [pay("S1", c1, snapshot[0]["amount"])]},
+            headers={"X-Debug-Sleep-Seconds": "3"}, timeout=15,
+        )
+
+    t = threading.Thread(target=slow_check)
+    t.start()
+    time.sleep(1)
+    st, info = call("POST", f"/sessions/{scid}/close")
+    check(st == 200 and info["status"] == "closed", "核对期间关闭被及时受理，状态=closed")
+    t.join()
+    st_slow, body_slow = box["r"]
+    check(st_slow in (409, 410),
+          f"在途核对在关闭后失败 HTTP {st_slow}，不换快照续算")
+    check("differences" not in body_slow, "失败的核对响应不含任何差异结论")
+    st, after = call("POST", "/settlement-checks",
+                     {"session_id": scid, "transactions": []})
+    check(st in (409, 410), f"关闭后再次核对同样被拒绝 HTTP {st}")
+
+    # ------------------------------------------------------------------
     # 收尾
     call("POST", f"/sessions/{sid1}/close")
 

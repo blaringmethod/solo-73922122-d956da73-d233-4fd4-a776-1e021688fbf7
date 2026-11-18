@@ -281,6 +281,202 @@ class SessionManager:
         return rows, has_more
 
     # ------------------------------------------------------------------
+    # 结算核对：在会话快照上逐笔核对本批净支付
+    # ------------------------------------------------------------------
+    def _reject_if_not_open(self, session: Session, session_id: str) -> None:
+        if session.status != "open":
+            raise SessionUnavailable(
+                "session_not_open",
+                f"会话 {session_id} 状态为 {session.status}，"
+                "关闭已受理或会话已结束，结算核对失败且不返回核对结论",
+                http_status=409,
+            )
+        if _utcnow() >= session.expires_at:
+            raise SessionUnavailable(
+                "session_expired",
+                f"会话 {session_id} 已到期，结算核对失败且不返回核对结论",
+                http_status=410,
+            )
+
+    def reconcile_settlement(
+        self,
+        session_id: str,
+        net_by_claim: dict[int, int],
+        diff_limit: int,
+    ) -> dict:
+        """在会话快照上逐笔核对按理赔汇总的净支付。
+
+        - 全程只允许在 ``open`` 且未到期的会话上进行；关闭受理、到期、
+          连接失效一律失败，不换快照续算。
+        - 快照理赔全集只存在于本次 SQL 的查询计划/临时结果中，
+          服务进程不缓存任何地区理赔全集。
+        """
+        session = self._get(session_id)
+
+        with session.state_lock:
+            self._reject_if_not_open(session, session_id)
+            session.in_flight += 1
+
+        try:
+            with session.io_lock:
+                # 拿到连接使用权后复核：关闭/到期可能在等锁期间发生，
+                # 已受理的核对必须失败，绝不换快照续算。
+                with session.state_lock:
+                    self._reject_if_not_open(session, session_id)
+                try:
+                    result = self._run_reconcile_sql(
+                        session, net_by_claim, diff_limit
+                    )
+                except SessionUnavailable:
+                    raise
+                except psycopg.Error as exc:
+                    # 连接丢失等数据库错误：会话作废，绝不换连接/换快照续算。
+                    self._teardown(session, reason="connection_lost")
+                    raise SessionError(
+                        "session_broken",
+                        f"数据库连接或快照失效，会话 {session_id} 已作废，"
+                        "结算核对不会换快照续取："
+                        f"{exc.sqlstate_name if hasattr(exc, 'sqlstate_name') else exc}",
+                        http_status=503,
+                    )
+                # SQL 返回后再复核一次：覆盖 SQL 执行期间关闭受理/到期的情形
+                with session.state_lock:
+                    self._reject_if_not_open(session, session_id)
+                return result
+        finally:
+            with session.state_lock:
+                session.in_flight -= 1
+
+    def _run_reconcile_sql(
+        self,
+        session: Session,
+        net_by_claim: dict[int, int],
+        diff_limit: int,
+    ) -> dict:
+        # 仅把本次提交涉及的理赔 id/净额作为数组参数传入；快照全集不落地。
+        claim_ids = list(net_by_claim.keys())
+        net_amounts = [net_by_claim[cid] for cid in claim_ids]
+
+        # 快照中本地区理赔总数（轻量 count，同样不缓存明细全集）
+        total_row = session.conn.execute(
+            """
+            SELECT count(*) AS snapshot_claim_count
+              FROM claims c
+              JOIN policies p ON p.id = c.policy_id
+             WHERE p.region = %s
+            """,
+            (session.region,),
+        ).fetchone()
+        snapshot_claim_count = int(total_row["snapshot_claim_count"])
+
+        # 用 unnest 把本批净额在 SQL 内展开为派生表，与快照 FULL OUTER JOIN：
+        #   - 快照有、净额为空/0  -> unsettled
+        #   - 净额 < 快照金额     -> underpaid
+        #   - 净额 > 快照金额     -> overpaid
+        #   - 净额有、快照为空    -> orphan（含非本地区理赔）
+        # 四类计数用窗口函数在 LIMIT 之前对全量差异求值，因此即使明细被
+        # 截断为前 30 条，总笔数仍覆盖全部差异。
+        sql = """
+            WITH paid(claim_id, net_amount) AS (
+                -- 两个数组按下标并行展开并显式排序配对，
+                -- 保证 claim_ids[i] 与 net_amounts[i] 严格对应
+                SELECT claim_id, net_amount
+                  FROM unnest(%s::bigint[], %s::bigint[])
+                       AS u(claim_id, net_amount)
+                 ORDER BY claim_id
+            ),
+            joined AS (
+                SELECT COALESCE(c.id, pa.claim_id)                AS claim_id,
+                       c.amount                                   AS snapshot_amount,
+                       COALESCE(pa.net_amount, 0)                 AS net_paid_amount,
+                       CASE
+                         WHEN c.id IS NULL THEN 'orphan'
+                         WHEN COALESCE(pa.net_amount, 0) = 0 THEN 'unsettled'
+                         WHEN pa.net_amount < c.amount THEN 'underpaid'
+                         WHEN pa.net_amount > c.amount THEN 'overpaid'
+                         ELSE 'matched'
+                       END                                        AS difference_type
+                  FROM claims c
+                  JOIN policies p ON p.id = c.policy_id AND p.region = %s
+                  FULL OUTER JOIN paid pa ON pa.claim_id = c.id
+            ),
+            diffs AS (
+                SELECT * FROM joined WHERE difference_type <> 'matched'
+            ),
+            counted AS (
+                SELECT d.*,
+                       count(*) FILTER (WHERE difference_type = 'unsettled')
+                           OVER () AS cnt_unsettled,
+                       count(*) FILTER (WHERE difference_type = 'underpaid')
+                           OVER () AS cnt_underpaid,
+                       count(*) FILTER (WHERE difference_type = 'overpaid')
+                           OVER () AS cnt_overpaid,
+                       count(*) FILTER (WHERE difference_type = 'orphan')
+                           OVER () AS cnt_orphan,
+                       count(*) OVER () AS cnt_total
+                  FROM diffs d
+            )
+            SELECT claim_id,
+                   difference_type,
+                   snapshot_amount,
+                   net_paid_amount,
+                   (net_paid_amount - COALESCE(snapshot_amount, 0)) AS difference_amount,
+                   COALESCE(cnt_unsettled, 0) AS cnt_unsettled,
+                   COALESCE(cnt_underpaid, 0) AS cnt_underpaid,
+                   COALESCE(cnt_overpaid, 0)  AS cnt_overpaid,
+                   COALESCE(cnt_orphan, 0)    AS cnt_orphan,
+                   COALESCE(cnt_total, 0)     AS cnt_total
+              FROM counted
+             ORDER BY claim_id ASC
+             LIMIT %s
+        """
+        rows = session.conn.execute(
+            sql, (claim_ids, net_amounts, session.region, diff_limit)
+        ).fetchall()
+
+        # 无任何差异时窗口结果为空，四类计数显式归零
+        if rows:
+            head = rows[0]
+            counts = {
+                "unsettled": int(head["cnt_unsettled"]),
+                "underpaid": int(head["cnt_underpaid"]),
+                "overpaid": int(head["cnt_overpaid"]),
+                "orphan": int(head["cnt_orphan"]),
+                "total": int(head["cnt_total"]),
+            }
+        else:
+            counts = {
+                "unsettled": 0,
+                "underpaid": 0,
+                "overpaid": 0,
+                "orphan": 0,
+                "total": 0,
+            }
+
+        differences = [
+            {
+                "claim_id": int(r["claim_id"]),
+                "difference_type": r["difference_type"],
+                "snapshot_amount": (
+                    None if r["snapshot_amount"] is None
+                    else int(r["snapshot_amount"])
+                ),
+                "net_paid_amount": int(r["net_paid_amount"]),
+                "difference_amount": int(r["difference_amount"]),
+            }
+            for r in rows
+        ]
+        return {
+            "region": session.region,
+            "snapshot_time": session.snapshot_time,
+            "snapshot_claim_count": snapshot_claim_count,
+            "settled_claim_count": len(net_by_claim),
+            "counts": counts,
+            "differences": differences,
+            "differences_truncated": counts["total"] > len(rows),
+        }
+
+    # ------------------------------------------------------------------
     # 关闭 / 到期
     # ------------------------------------------------------------------
     def close(self, session_id: str, reason: str = "closed") -> Session:

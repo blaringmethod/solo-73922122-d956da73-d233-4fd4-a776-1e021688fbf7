@@ -25,6 +25,8 @@ class Settings:
     enable_debug_hooks: bool
     pool_min_size: int
     pool_max_size: int
+    settlement_max_transactions: int
+    settlement_diff_limit: int
 
     @staticmethod
     def from_env() -> "Settings":
@@ -45,6 +47,12 @@ class Settings:
             in ("1", "true", "yes", "on"),
             pool_min_size=_int_env("POOL_MIN_SIZE", 1),
             pool_max_size=_int_env("POOL_MAX_SIZE", 10),
+            # 单次结算核对最多受理的交易条数（支付 + 冲正合计）
+            settlement_max_transactions=_int_env(
+                "SETTLEMENT_MAX_TRANSACTIONS", 200
+            ),
+            # 差异明细最多按理赔 id 升序返回多少条
+            settlement_diff_limit=_int_env("SETTLEMENT_DIFF_LIMIT", 30),
         )
 
 

@@ -20,8 +20,12 @@ from .schemas import (
     PolicyOut,
     SessionInfo,
     SessionStatus,
+    SettlementCheckRequest,
+    SettlementCheckResult,
+    SettlementDifference,
 )
 from .session_manager import SessionError, SessionManager
+from .settlement import SettlementValidationError, validate_and_aggregate
 
 manager = SessionManager(settings)
 
@@ -34,15 +38,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="理赔明细分批提取 API",
+    title="理赔明细提取与结算核对 API",
     description=(
-        "按地区开启快照会话，按理赔 id 升序分页提取。\n\n"
+        "按地区开启快照会话，按理赔 id 升序分页提取；"
+        "结算流水入仓前在同一会话快照上逐笔核对净支付。\n\n"
         "- 会话内两表（policies/claims）固定为开启时刻的同一快照\n"
-        "- 源端增改删照常提交，不影响会话内读取\n"
+        "- 源端增改删照常提交，不影响会话内读取与核对依据\n"
         f"- 最多 {settings.max_sessions} 个并发会话，会话 {settings.session_ttl_seconds} 秒到期\n"
-        "- 关闭受理后未开始响应的取页一律失败，不返回明细"
+        "- 关闭受理后未开始响应的取页/核对一律失败，不换快照续算\n"
+        f"- POST /settlement-checks 单次至多 {settings.settlement_max_transactions} 条交易，"
+        f"差异按理赔 id 升序返回前 {settings.settlement_diff_limit} 条"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -55,6 +62,21 @@ async def session_error_handler(request: Request, exc: SessionError):
     return JSONResponse(
         status_code=exc.http_status,
         content={"detail": exc.message, "code": exc.code},
+    )
+
+
+@app.exception_handler(SettlementValidationError)
+async def settlement_validation_handler(
+    request: Request, exc: SettlementValidationError
+):
+    # 重复 ID / 非法冲正 / 超条数：整批拒绝，响应中不包含任何核对结论
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": exc.message,
+            "code": exc.code,
+            "issues": exc.issues,
+        },
     )
 
 
@@ -85,6 +107,8 @@ def meta():
         "max_sessions": settings.max_sessions,
         "session_ttl_seconds": settings.session_ttl_seconds,
         "page_size_cap": settings.page_size_cap,
+        "settlement_max_transactions": settings.settlement_max_transactions,
+        "settlement_diff_limit": settings.settlement_diff_limit,
         "debug_hooks_enabled": settings.enable_debug_hooks,
     }
 
@@ -189,6 +213,71 @@ async def fetch_claims(
         has_more=has_more,
         snapshot_time=session.snapshot_time,
         rows=[ClaimRow(**row) for row in rows],
+    )
+
+
+# ----------------------------------------------------------------------
+# 结算核对：地区结算流水入仓前，核对是否足额覆盖会话快照
+# ----------------------------------------------------------------------
+@app.post(
+    "/settlement-checks",
+    response_model=SettlementCheckResult,
+    tags=["settlement"],
+    summary="提交结算流水，按会话快照逐笔核对是否足额覆盖",
+    responses={
+        404: {"model": Message, "description": "会话不存在或已失效"},
+        409: {"model": Message, "description": "关闭已受理/会话不可用，核对失败"},
+        410: {"model": Message, "description": "会话已到期，核对失败"},
+        422: {
+            "description": "重复交易 ID 或非法冲正/超条数：整批拒绝，无部分结论",
+        },
+        503: {"model": Message, "description": "快照连接失效，会话作废且不换快照"},
+    },
+)
+async def create_settlement_check(
+    body: SettlementCheckRequest, request: Request
+):
+    # 1) 先做整批静态校验：重复 ID / 非法冲正 / 超条数一律 422 整批拒绝，
+    #    此阶段不触碰会话快照连接，也不产生任何部分核对结论。
+    net_by_claim = validate_and_aggregate(
+        body.transactions, settings.settlement_max_transactions
+    )
+
+    # 演示用慢核对钩子（与慢取页同一开关）：在访问快照前睡眠，
+    # 用于演示核对进行中关闭受理/到期时，核对必须失败且不续算。
+    if settings.enable_debug_hooks:
+        raw = request.headers.get("x-debug-sleep-seconds")
+        if raw:
+            try:
+                delay = max(0.0, min(30.0, float(raw)))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="非法的调试延迟头")
+            await asyncio.to_thread(time.sleep, delay)
+
+    # 2) 在会话的同一快照连接上现场核对：关闭受理/到期/连接失效均失败，
+    #    不换快照续算；进程不缓存地区理赔全集。
+    result = await asyncio.to_thread(
+        manager.reconcile_settlement,
+        body.session_id,
+        net_by_claim,
+        settings.settlement_diff_limit,
+    )
+    counts = result["counts"]
+    return SettlementCheckResult(
+        session_id=body.session_id,
+        region=result["region"],
+        snapshot_time=result["snapshot_time"],
+        transaction_count=len(body.transactions),
+        settled_claim_count=result["settled_claim_count"],
+        snapshot_claim_count=result["snapshot_claim_count"],
+        unsettled_count=counts["unsettled"],
+        underpaid_count=counts["underpaid"],
+        overpaid_count=counts["overpaid"],
+        orphan_count=counts["orphan"],
+        total_difference_count=counts["total"],
+        differences=[SettlementDifference(**d) for d in result["differences"]],
+        differences_truncated=result["differences_truncated"],
+        ready_for_warehouse=counts["total"] == 0,
     )
 
 
